@@ -129,6 +129,10 @@ def analyze_draft(
         # Quote / poll.
         if draft.quote_of and not cap.supports_quote:
             errors.append("this account does not support quote posts")
+        if draft.quote_of and account.network == "mastodon" and draft.media:
+            errors.append("Mastodon quote posts cannot include media attachments")
+        if draft.quote_of and account.network == "mastodon" and draft.poll:
+            errors.append("Mastodon quote posts cannot include a poll")
         if draft.poll and not cap.supports_polls:
             errors.append("this network has no native polls; "
                           "consider an external accessible poll")

@@ -87,3 +87,16 @@ def test_mastodon_url_weighting_in_length():
     r = analyze_draft(d, accounts, caps)
     # 'look ' (5) + weighted url (23) = 28, well under 500
     assert r.per_network[0].length == 28
+
+
+def test_mastodon_quote_rejects_media_and_poll():
+    accounts, caps = _ctx()
+    caps["m"] = caps["m"].merge(supports_quote=True)
+    draft = Draft(
+        text="Comment", targets=["m"], quote_of="42",
+        media=[Media(kind="image", alt_text="Description")],
+        poll=Poll(options=[PollOption("Yes"), PollOption("No")]),
+    )
+    errors = analyze_draft(draft, accounts, caps).per_network[0].errors
+    assert any("cannot include media" in error for error in errors)
+    assert any("cannot include a poll" in error for error in errors)

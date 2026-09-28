@@ -16,7 +16,7 @@ network adapters                 quill_social/adapters/
         |
 model + capabilities + store     quill_social/{model,capabilities,db}.py
         |
-OS data dir (+ future keystore)  quill_social/paths.py
+OS data dir + keyring            quill_social/{paths,security/credentials}.py
 ```
 
 Everything below the UI is **wx-free** and unit-tested headlessly. The UI is a
@@ -24,8 +24,9 @@ thin layer: it renders items, routes keystrokes to commands, and speaks state.
 
 ## Key decisions
 
-- **Capability detection before assumption.** Nothing branches on a network
-  name. The UI and composer ask the `CapabilityRegistry`, which is seeded per
+- **Capability detection before assumption.** The UI and composer ask the
+  `CapabilityRegistry` for feature availability, with network-specific branches
+  for API semantics such as character counting. The registry is seeded per
   network and refined by a live server probe. Two Mastodon servers can differ.
 
 - **The mock network is a first-class adapter.** `MockNetwork` is the reference
@@ -52,14 +53,9 @@ thin layer: it renders items, routes keystrokes to commands, and speaks state.
 
 ## Where the boundaries are
 
-- `adapters/mastodon.py` and `adapters/bluesky.py` ship capability descriptors
-  and raise a clear `AdapterError` on any live call, with a `refine_from_*`
-  method showing how a real probe sharpens the defaults. Wiring the live client
-  means implementing the read/publish methods against a token resolved from the
-  OS credential store — no schema or UI change required.
-
-- Cloud scheduling, AI, GitHub, media playback, and QuilleSync have model and
-  service seams but no implementation in this slice.
+- `adapters/mastodon.py` and `adapters/bluesky.py` call live SDK clients supplied by the registry, using credentials resolved from the OS keyring. Without a configured client they raise a clear `AdapterError`.
+- Publishing, conversation fetching, refresh, and scheduled delivery use background workers. SQLite reads and writes stay on the UI thread; workers receive detached account, draft, and plan snapshots.
+- Cloud scheduling, production AI, hosted teamwork, media playback, and ecosystem integrations retain interfaces or prototypes that require further implementation and validation.
 
 ## Testing
 

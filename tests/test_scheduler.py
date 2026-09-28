@@ -99,3 +99,41 @@ def test_scheduler_skips_future_plans(store):
                               clock=lambda: 1000)
     assert scheduler.run_due() == []
     assert store.get_plan(plan.plan_id).state == "scheduled"
+
+
+def test_scheduler_resolution_failure_does_not_block_other_accounts(store):
+    draft = Draft(text="scheduled body", targets=["broken", "working"])
+    store.put_draft(draft)
+    for account in draft.targets:
+        store.put_plan(PublicationPlan(draft_id=draft.draft_id, account_id=account,
+                                      network="mock", state="queued", scheduled_for=500))
+
+    def resolve(account_id):
+        if account_id == "broken":
+            raise RuntimeError("Account unavailable")
+        return ScriptedAdapter(["ok"])
+
+    scheduler = sch.Scheduler(store, resolve, clock=lambda: 1000)
+    results = {r.plan.account_id: r for r in scheduler.run_due()}
+    assert results["working"].published
+    failure = results["broken"]
+    assert failure.retry_scheduled
+    assert failure.plan.next_retry_at == 31000
+    assert failure.plan.attempts[-1].error_message == "Account unavailable"
+    assert scheduler.run_due() == []
+
+
+def test_scheduler_permission_resolution_failure_requires_review(store):
+    plan, draft = _plan_and_draft()
+    plan.state = "queued"
+    store.put_draft(draft)
+    store.put_plan(plan)
+
+    def resolve(_account):
+        raise AdapterError("Sign in again", kind="permission")
+
+    result, = sch.Scheduler(store, resolve).run_due()
+    assert result.review_required
+    assert not result.retry_scheduled
+    assert store.get_plan(plan.plan_id).state == "failed"
+    assert "Sign in again" in result.message

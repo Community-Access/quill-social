@@ -167,3 +167,36 @@ def test_outbox_lists_and_removes(app, store):
         assert Outbox(store).list() == []
     finally:
         dlg.Destroy()
+
+
+def test_outbox_removal_announces_only_success(app, store, monkeypatch):
+    from types import SimpleNamespace
+
+    messages = []
+    frame = wx.Frame(None)
+    frame.announcer = SimpleNamespace(
+        say=lambda text, level: messages.append((text, level)),
+        error=lambda text: messages.append((text, "error")),
+    )
+    Outbox(store).enqueue(OutboxItem(account_id="acct1", network="mastodon", text="hi"))
+    dlg = manage.OutboxDialog(frame, store)
+    try:
+        dlg._on_remove(None)
+        assert messages == []
+        dlg.item_list.Select(0)
+        remove = dlg.outbox.remove
+
+        def fail(_item):
+            raise RuntimeError("Storage unavailable")
+
+        monkeypatch.setattr(dlg.outbox, "remove", fail)
+        dlg._on_remove(None)
+        assert messages == [("Could not remove outbox post: Storage unavailable", "error")]
+        assert len(Outbox(store).list()) == 1
+        monkeypatch.setattr(dlg.outbox, "remove", remove)
+        dlg._on_remove(None)
+        assert messages[-1] == ("Post removed from outbox.", "action")
+        assert Outbox(store).list() == []
+    finally:
+        dlg.Destroy()
+        frame.Destroy()

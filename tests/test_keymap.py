@@ -57,3 +57,34 @@ def test_persistence_roundtrip(tmp_path):
 
 def test_load_missing_returns_defaults(tmp_path):
     assert km_mod.load(tmp_path).chord_for("compose") == "Ctrl+N"
+
+
+def test_cleared_binding_stays_cleared_after_restart(tmp_path):
+    keymap = Keymap()
+    keymap.rebind("compose", "")
+    km_mod.save(tmp_path, keymap)
+    loaded = km_mod.load(tmp_path)
+    assert loaded.command_for("Ctrl+N") is None
+    assert loaded.command_for("") is None
+
+
+def test_forced_binding_does_not_revive_old_owner_after_restart(tmp_path):
+    keymap = Keymap()
+    keymap.rebind("reply", "Ctrl+N", force=True)
+    km_mod.save(tmp_path, keymap)
+    loaded = km_mod.load(tmp_path)
+    assert loaded.command_for("Ctrl+N") == "reply"
+    assert loaded.chord_for("compose") == ""
+
+
+@pytest.mark.parametrize("value", ["Ctrl", "Ctrl+N+M", "Ctrl+Unknown", "Ctrl++N"])
+def test_invalid_editable_shortcut_is_rejected(value):
+    with pytest.raises(ValueError):
+        km_mod.validate_chord(value)
+
+
+def test_named_keys_and_global_validation():
+    assert km_mod.validate_chord("ctrl+enter") == "Ctrl+Enter"
+    assert km_mod.validate_chord("shift+f5") == "Shift+F5"
+    with pytest.raises(ValueError, match="Ctrl or Alt"):
+        km_mod.validate_chord("F5", global_hotkey=True)

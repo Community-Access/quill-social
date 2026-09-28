@@ -26,16 +26,21 @@ classifiers = [
 # quill[ui], matching quill-radio and quill-cast (see PRD section 44).
 #
 # The P0 slice runs entirely against local storage and a deterministic mock
-# network, so wxPython is the only hard runtime dependency. Live Mastodon and
-# Bluesky adapters add their client libraries under the [networks] extra.
-dependencies = ["wxPython>=4.2.0"]
+# network. Windows includes direct screen-reader output and timezone data.
+# Live adapters add their client libraries under the [networks] extra.
+dependencies = [
+  "wxPython>=4.2.0",
+  "tzdata; sys_platform == 'win32'",
+  "accessible-output2>=0.17; sys_platform == 'win32'",
+]
 
 [project.optional-dependencies]
+security = ["keyring>=25"]
 # Live network adapters. The app runs and is fully navigable without these
 # (the mock adapter drives the P0 experience); installing them lights up real
 # Mastodon and Bluesky accounts.
 networks = [
-  "Mastodon.py>=1.8.1",
+  "Mastodon.py>=2.2.2",
   "atproto>=0.0.55",
 ]
 # Embedded media playback (PRD 19.2). Falls back to the OS default player

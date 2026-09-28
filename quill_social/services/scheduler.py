@@ -81,6 +81,33 @@ class StepResult:
     message: str
 
 
+def _failed_attempt(plan: PublicationPlan, exc: AdapterError, at: int) -> StepResult:
+    """Persistable failure outcome shared by resolution and delivery failures."""
+    attempt = DeliveryAttempt(
+        attempted_at=at, ok=False,
+        error_kind=exc.kind, error_message=str(exc),
+    )
+    plan.attempts.append(attempt)
+    plan.updated = at
+    if needs_review(exc.kind) or plan.retry_count >= MAX_RETRIES:
+        plan.state = "failed"
+        plan.next_retry_at = None
+        reason = (
+            "needs review" if needs_review(exc.kind)
+            else f"gave up after {MAX_RETRIES} retries"
+        )
+        return StepResult(plan, False, needs_review(exc.kind), False,
+                          f"Failed: {exc} ({reason}).")
+    # transient: schedule a backoff retry. retry_count already includes the
+    # failure we just appended, so the first failure backs off by the base
+    # delay (backoff_ms(0)).
+    delay = exc.retry_after_ms or backoff_ms(plan.retry_count - 1)
+    plan.next_retry_at = at + delay
+    plan.state = "queued"
+    return StepResult(plan, False, False, True,
+                      f"Transient error; retry in {delay // 1000}s.")
+
+
 def process_plan(
     plan: PublicationPlan,
     adapter: NetworkAdapter,
@@ -102,35 +129,43 @@ def process_plan(
         in_reply_to=draft.in_reply_to,
         quote_of=draft.quote_of,
         media=list(draft.media),
+        poll=draft.poll,
+        poll_expires_in=((draft.poll.expires_at - draft.created) // 1000
+                         if draft.poll and draft.poll.expires_at else None),
         idempotency_key=f"{plan.plan_id}",
     )
     plan.state = "publishing"
     try:
-        published = adapter.publish(request)
+        if draft.thread_mode:
+            from quill_social.services.thread_publisher import publish_thread
+            from quill_social.services.thread_splitter import mastodon_counter, split_thread
+            caps = adapter.capabilities()
+            counter = mastodon_counter if adapter.name == "mastodon" else len
+            split = split_thread(draft.text, caps.char_limit, counter=counter)
+            outcome = publish_thread(
+                adapter, split.texts(), run_id=plan.plan_id,
+                visibility=draft.visibility, content_warning=draft.content_warning,
+                lang=draft.lang, reply_to=draft.in_reply_to, quote_of=draft.quote_of,
+                media=list(draft.media), poll=draft.poll, poll_expires_in=request.poll_expires_in)
+            if not outcome.ok:
+                failure = outcome.results[-1]
+                if outcome.parent_remote_id:
+                    plan.remote_id = outcome.parent_remote_id
+                    plan.state = "partial"
+                    plan.updated = at
+                    plan.next_retry_at = None
+                    plan.attempts.append(DeliveryAttempt(
+                        attempted_at=at, ok=False, published_id=outcome.parent_remote_id,
+                        error_kind=failure.error_kind, error_message=failure.error_message))
+                    return StepResult(plan, False, True, False,
+                                      f"{outcome.summary()} {failure.error_message} Review before resending.")
+                return _failed_attempt(plan, AdapterError(failure.error_message, kind=failure.error_kind), at)
+            from quill_social.adapters.base import PublishResult
+            published = PublishResult(remote_id=outcome.parent_remote_id)
+        else:
+            published = adapter.publish(request)
     except AdapterError as exc:
-        attempt = DeliveryAttempt(
-            attempted_at=at, ok=False,
-            error_kind=exc.kind, error_message=str(exc),
-        )
-        plan.attempts.append(attempt)
-        plan.updated = at
-        if needs_review(exc.kind) or plan.retry_count >= MAX_RETRIES:
-            plan.state = "failed"
-            plan.next_retry_at = None
-            reason = (
-                "needs review" if needs_review(exc.kind)
-                else f"gave up after {MAX_RETRIES} retries"
-            )
-            return StepResult(plan, False, needs_review(exc.kind), False,
-                              f"Failed: {exc} ({reason}).")
-        # transient: schedule a backoff retry. retry_count already includes the
-        # failure we just appended, so the first failure backs off by the base
-        # delay (backoff_ms(0)).
-        delay = exc.retry_after_ms or backoff_ms(plan.retry_count - 1)
-        plan.next_retry_at = at + delay
-        plan.state = "queued"
-        return StepResult(plan, False, False, True,
-                          f"Transient error; retry in {delay // 1000}s.")
+        return _failed_attempt(plan, exc, at)
 
     attempt = DeliveryAttempt(attempted_at=at, ok=True, published_id=published.remote_id)
     plan.attempts.append(attempt)
@@ -168,12 +203,20 @@ class Scheduler:
             if draft is None:
                 plan.state = "failed"
                 plan.updated = at
+                plan.next_retry_at = None
                 self.store.put_plan(plan)
                 results.append(StepResult(plan, False, True, False,
                                           "Draft missing; cannot publish."))
                 continue
-            adapter = self.resolve_adapter(plan.account_id)
-            step = process_plan(plan, adapter, draft, now=at)
+            try:
+                adapter = self.resolve_adapter(plan.account_id)
+                step = process_plan(plan, adapter, draft, now=at)
+            except AdapterError as exc:
+                step = _failed_attempt(plan, exc, at)
+            except Exception as exc:
+                # An unavailable account or unexpected adapter failure must not
+                # silently abort every other account's scheduled deliveries.
+                step = _failed_attempt(plan, AdapterError(str(exc)), at)
             self.store.put_plan(step.plan)
             results.append(step)
         return results

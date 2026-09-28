@@ -12,11 +12,12 @@ speech. What is spoken is data, never color or position (PRD 6.5).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 
 from quill_social.a11y import A11ySettings
 from quill_social.model import Account, SocialItem
+from quill_social.time_display import display_datetime
 
 # Every field a row can expose (PRD 12.4), keyed by a stable id.
 AVAILABLE_FIELDS: dict[str, str] = {
@@ -69,7 +70,7 @@ class FieldProfile:
         return [f for f in self.order if f in AVAILABLE_FIELDS]
 
 
-def _rel_time(created_at: int, *, now: int | None = None) -> str:
+def _rel_time(created_at: int, *, now: int | None = None, timezone: str = "system") -> str:
     from quill_social.model import now_ms
 
     now = now if now is not None else now_ms()
@@ -85,7 +86,7 @@ def _rel_time(created_at: int, *, now: int | None = None) -> str:
     if delta < 604800:
         d = delta // 86400
         return f"{d} day{'s' if d != 1 else ''} ago"
-    dt = datetime.fromtimestamp(created_at / 1000, tz=UTC)
+    dt = display_datetime(created_at, timezone)
     return dt.strftime("%Y-%m-%d")
 
 
@@ -109,14 +110,31 @@ def field_value(
 ) -> str:
     """The spoken value of one field for one item. Empty string means omit."""
     s = settings or A11ySettings()
+    from quill_social.reading_options import plain_characters
+    warning_mode = s.account_options.get(item.account_id, {}).get("content_warning_mode", "warning_then_text")
     if field_id == "author":
-        return item.author_display or item.author_handle
+        author = item.author_display or item.author_handle
+        return plain_characters(author) if s.remove_unicode else author
     if field_id == "handle":
         return item.author_handle
     if field_id == "text":
-        return item.text.replace("\n", " ").strip()
+        if item.content_warning and warning_mode == "warning_only":
+            return ""
+        text = item.text.replace("\n", " ").strip()
+        if s.condense_mentions:
+            leading = re.match(r"^(?:@[\w.-]+(?:@[\w.-]+)?\s+){2,}", text)
+            if leading:
+                recipients = leading.group().split()
+                text = f"{recipients[0]} and {len(recipients) - 1} others: {text[leading.end():]}"
+        if s.exclude_web_addresses:
+            text = re.sub(r"https?://\S+", "", text)
+            text = " ".join(text.split())
+        return plain_characters(text) if s.remove_unicode else text
     if field_id == "date":
-        return _rel_time(item.created_at, now=now)
+        if s.post_timestamps_relative:
+            return _rel_time(item.created_at, now=now, timezone=s.display_timezone)
+        pattern = "%Y-%m-%d %I:%M %p %Z" if s.post_timestamps_12_hour else "%Y-%m-%d %H:%M %Z"
+        return display_datetime(item.created_at, s.display_timezone).strftime(pattern)
     if field_id == "network":
         return item.network.capitalize()
     if field_id == "account":
@@ -148,7 +166,10 @@ def field_value(
             return "all media described"
         return f"{missing} of {len(item.media)} missing alt text"
     if field_id == "content_warning":
-        return f"content warning: {item.content_warning}" if item.content_warning else ""
+        if warning_mode == "text_only":
+            return ""
+        warning = plain_characters(item.content_warning) if s.remove_unicode else item.content_warning
+        return f"content warning: {warning}" if warning else ""
     if field_id == "moderation":
         return ", ".join(item.moderation_labels)
     if field_id == "language":
@@ -181,7 +202,7 @@ def read_fields(
     nothing after it.
     """
     out: list[tuple[str, str]] = []
-    for fid in profile.enabled():
+    for fid in _ordered_fields(profile, item, settings or A11ySettings()):
         val = field_value(item, fid, account=account, settings=settings, now=now)
         if val:
             out.append((AVAILABLE_FIELDS[fid], val))
@@ -203,13 +224,34 @@ def render_row(
     terse and fast to hear.
     """
     s = settings or A11ySettings()
-    pieces: list[str] = []
-    for fid in profile.enabled():
+    pieces: list[tuple[str, str]] = []
+    for fid in _ordered_fields(profile, item, s):
         if fid == "network" and not s.speak_network_prefix:
             continue
         if fid == "engagement" and not s.speak_engagement:
             continue
         val = field_value(item, fid, account=account, settings=s, now=now)
         if val:
-            pieces.append(val)
-    return ". ".join(pieces)
+            pieces.append((fid, val))
+    if not pieces:
+        return ""
+    rendered = pieces[0][1]
+    for index in range(1, len(pieces)):
+        previous_field = pieces[index - 1][0]
+        field_id, value = pieces[index]
+        # Match the recovered client's "Author: post" timeline format. A
+        # colon creates a reliable speech boundary when the body begins with
+        # an @mention; a period before @ is often run together by NVDA.
+        separator = (": " if previous_field == "author"
+                     and field_id in {"text", "content_warning"} else ". ")
+        rendered += separator + value
+    return rendered
+
+
+def _ordered_fields(profile, item, settings):
+    fields = profile.enabled()
+    mode = settings.account_options.get(item.account_id, {}).get("content_warning_mode", "warning_then_text")
+    if item.content_warning and mode == "warning_then_text" and "text" in fields and "content_warning" in fields:
+        fields.remove("content_warning")
+        fields.insert(fields.index("text"), "content_warning")
+    return fields

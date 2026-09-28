@@ -12,6 +12,12 @@ from quill_social.adapters.base import (
 )
 from quill_social.capabilities import default_for
 from quill_social.db import SocialStore
+from quill_social.ui.announce import Announcer
+
+
+@pytest.fixture(autouse=True)
+def _no_live_speech(monkeypatch):
+    monkeypatch.setattr(Announcer, "_make_speaker", lambda self: None)
 
 
 @pytest.fixture(autouse=True)

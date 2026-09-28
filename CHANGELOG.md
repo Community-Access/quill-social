@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Keep notification subjects and conversation replies out of Home unless returned by the account's Home feed; persist Home membership across restarts.
+
+- Add Standard and Advanced interfaces, account-scoped navigation, simplified composing, and recovered-client preferences without removing Advanced features.
+- Improve live Mastodon notifications, quote posts, automatic announcements, and author punctuation; use the system timezone by default.
+- Deliver composer media and polls, preserve failed compositions as drafts, and connect Bluesky reply and quote relationships.
+- Fetch conversations from live adapters and run scheduled posting outside the UI thread.
+- Apply saved quiet hours to automatic notification speech and clarify the PRD implementation scope.
+
+
 All notable changes to QUILL Social are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning once it reaches a stable release.

@@ -20,6 +20,22 @@ def test_render_row_default_is_terse():
     assert "favourites" not in row
 
 
+def test_render_row_pauses_between_author_and_leading_mention():
+    item = _item()
+    item.text = "@grace Thanks for the update"
+    row = render_row(item, FieldProfile(), settings=A11ySettings())
+    assert row.startswith("Ada: @grace Thanks for the update")
+
+
+def test_render_row_uses_author_colon_before_content_warning():
+    item = _item(content_warning="Spoilers")
+    item.text = "@grace Details"
+    settings = A11ySettings(
+        account_options={item.account_id: {"content_warning_mode": "warning_then_text"}})
+    row = render_row(item, FieldProfile(), settings=settings)
+    assert row.startswith("Ada: content warning: Spoilers. @grace Details")
+
+
 def test_render_row_speaks_engagement_when_enabled():
     it = _item()
     s = A11ySettings(speak_engagement=True)
@@ -75,3 +91,21 @@ def test_account_field_uses_account_label():
 def test_relative_time_recent():
     it = _item(created_at=now_ms() - 30_000)
     assert field_value(it, "date", now=now_ms()) == "just now"
+
+
+def test_reading_preferences_change_presentation_without_modifying_post():
+    original = "@ada@example.org @grace Check https://example.org/post for details"
+    item = SocialItem(text=original)
+    settings = A11ySettings(condense_mentions=True, exclude_web_addresses=True)
+    assert field_value(item, "text", settings=settings) == "@ada@example.org and 1 others: Check for details"
+    assert field_value(item, "text") == original
+    assert item.text == original
+    assert field_value(SocialItem(text="Hello @ada @grace"), "text", settings=settings) == "Hello @ada @grace"
+
+
+def test_absolute_post_times_support_12_hour_clock():
+    item = SocialItem(created_at=0)
+    settings = A11ySettings(post_timestamps_relative=False, display_timezone="utc")
+    assert field_value(item, "date", settings=settings) == "1970-01-01 00:00 UTC"
+    settings.post_timestamps_12_hour = True
+    assert field_value(item, "date", settings=settings) == "1970-01-01 12:00 AM UTC"

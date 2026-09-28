@@ -34,10 +34,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 from quill_social.adapters.base import (
     AdapterError,
     NetworkAdapter,
+    NotificationEvent,
     PublishRequest,
     PublishResult,
 )
@@ -246,31 +248,254 @@ class BlueskyAdapter(NetworkAdapter):
             raise AdapterError(_NOT_WIRED, kind="permission")
         return self._client
 
+    def own_profile(self) -> dict:
+        client = self._require_client()
+        try:
+            response = client.com.atproto.repo.get_record({
+                "repo": self.did, "collection": "app.bsky.actor.profile", "rkey": "self",
+            })
+            record = _as_dict(_attr(response, "value", {}))
+        except Exception as exc:
+            raise _bluesky_error(exc) from exc
+        return {"display_name": record.get("displayName", record.get("display_name", "")) or "",
+                "note": record.get("description") or ""}
+
+    def update_profile(self, changes: dict) -> None:
+        client = self._require_client()
+        try:
+            # Read again before saving; retain avatar, banner, labels and unknown fields.
+            response = client.com.atproto.repo.get_record({
+                "repo": self.did, "collection": "app.bsky.actor.profile", "rkey": "self",
+            })
+            value = _attr(response, "value", {})
+            record = dict(value) if isinstance(value, dict) else value.model_dump(by_alias=True, exclude_none=True)
+            if "display_name" in changes:
+                record["displayName"] = changes["display_name"]
+            if "note" in changes:
+                record["description"] = changes["note"]
+            client.com.atproto.repo.put_record({
+                "repo": self.did, "collection": "app.bsky.actor.profile", "rkey": "self",
+                "record": record, "swap_record": _attr(response, "cid"),
+            })
+        except Exception as exc:
+            raise _bluesky_error(exc) from exc
+
     def home_timeline(self, *, limit: int = 40, since_id: str = "") -> list[SocialItem]:
         client = self._require_client()
         try:
-            resp = client.get_timeline(limit=limit)
+            resp = client.get_timeline(limit=min(limit, 100))
+            feed = list(_attr(resp, "feed", []) or [])
+            cursor = _attr(resp, "cursor", None)
+            seen_cursors = set()
+            while len(feed) < limit and cursor and cursor not in seen_cursors:
+                seen_cursors.add(cursor)
+                resp = client.get_timeline(limit=min(100, limit - len(feed)), cursor=cursor)
+                page = list(_attr(resp, "feed", []) or [])
+                if not page:
+                    break
+                feed.extend(page)
+                cursor = _attr(resp, "cursor", None)
         except Exception as exc:  # noqa: BLE001 -- normalized below
             raise _bluesky_error(exc) from exc
-        feed = _attr(resp, "feed", []) or []
         return [
             _feedview_to_item(_as_dict(fv), account_id=self._account_id) for fv in feed
         ]
 
     def notifications(self, *, limit: int = 40) -> list[SocialItem]:
+        return [event.item for event in self.notification_events(limit=limit)
+                if event.item is not None]
+
+    def fetch_timeline(self, kind: str, value: str = "", *, limit: int = 40) -> list[SocialItem]:
         client = self._require_client()
-        getter = getattr(client, "get_notifications", None)
+        if kind in {"local", "instance"}:
+            raise AdapterError("Bluesky does not have instance timelines.", kind="validation")
+        if kind == "messages":
+            return self._messages(limit=limit)
+        if kind not in {"user", "hashtag", "list"} or not value.strip():
+            raise AdapterError("Choose a user, hashtag or list.", kind="validation")
         try:
-            resp = getter() if getter is not None else client.get_timeline(limit=limit)
+            if kind == "user":
+                response = client.app.bsky.feed.get_author_feed({
+                    "actor": value.strip().lstrip("@"), "limit": min(limit, 100),
+                })
+            elif kind == "hashtag":
+                tag = value.strip().lstrip("#")
+                response = client.app.bsky.feed.search_posts({
+                    "q": "#" + tag, "tag": [tag], "sort": "latest", "limit": min(limit, 100),
+                })
+                return [_post_to_item(_as_dict(post), account_id=self._account_id)
+                        for post in _attr(response, "posts", []) or []]
+            else:
+                response = client.app.bsky.feed.get_list_feed({"list": value, "limit": min(limit, 100)})
+            return [_feedview_to_item(_as_dict(post), account_id=self._account_id)
+                    for post in _attr(response, "feed", []) or []]
+        except Exception as exc:
+            raise _bluesky_error(exc) from exc
+
+    def timeline_lists(self) -> list[tuple[str, str]]:
+        client = self._require_client()
+        result = []
+        cursor = None
+        seen = set()
+        try:
+            while True:
+                params = {"actor": self.did, "limit": 100, "purposes": ["curatelist"]}
+                if cursor:
+                    params["cursor"] = cursor
+                response = client.app.bsky.graph.get_lists(params)
+                for entry in _attr(response, "lists", []) or []:
+                    entry = _as_dict(entry)
+                    if entry.get("uri") and entry.get("purpose", "").endswith("curatelist"):
+                        result.append((entry["uri"], entry.get("name") or entry["uri"]))
+                cursor = _attr(response, "cursor")
+                if not cursor or cursor in seen:
+                    break
+                seen.add(cursor)
+        except Exception as exc:
+            raise _bluesky_error(exc) from exc
+        return result
+
+    def search(self, query: str, search_type: str = "", *, limit: int = 40) -> list[SocialItem]:
+        query = query.strip()
+        if not query or search_type not in {"", "statuses", "accounts", "hashtags"}:
+            raise AdapterError("Enter search text and choose a valid result type.", kind="validation")
+        client = self._require_client()
+        items = []
+        try:
+            if search_type in {"", "statuses"}:
+                response = client.app.bsky.feed.search_posts({"q": query, "limit": min(limit, 100)})
+                items.extend(_post_to_item(_as_dict(post), account_id=self._account_id)
+                             for post in _attr(response, "posts", []) or [])
+            if search_type in {"", "accounts"}:
+                response = client.app.bsky.actor.search_actors({"q": query, "limit": min(limit, 100)})
+                for profile in _attr(response, "actors", []) or []:
+                    profile = _as_dict(profile)
+                    handle = _handle(profile)
+                    display = profile.get("display_name") or profile.get("displayName") or handle
+                    description = profile.get("description", "") or ""
+                    did = profile.get("did", "") or handle
+                    items.append(SocialItem(
+                        network="bluesky", account_id=self._account_id,
+                        remote_id=f"search:user:{did}", uri=f"https://bsky.app/profile/{did}",
+                        author_id=did, author_handle=handle, author_display=display,
+                        text=f"User: {display} {handle}. {description}".strip(),
+                    ))
+            if search_type in {"", "hashtags"}:
+                tag = query.lstrip("#").strip()
+                if tag:
+                    items.append(SocialItem(
+                        network="bluesky", account_id=self._account_id,
+                        remote_id=f"search:hashtag:{tag.casefold()}",
+                        uri=f"https://bsky.app/hashtag/{quote(tag)}", author_handle=f"#{tag}",
+                        author_display="Hashtag", text=f"Hashtag: #{tag}",
+                    ))
+        except Exception as exc:
+            raise _bluesky_error(exc) from exc
+        return items
+
+    def _chat(self) -> Any:
+        # SDK clones the authenticated client and sets atproto-proxy for bsky.chat.
+        return self._require_client().with_bsky_chat_proxy().chat.bsky.convo
+
+    def _message_item(self, message: dict, convo_id: str, members: list) -> SocialItem:
+        sender = (message.get("sender") or {}).get("did", "")
+        profile = next((_as_dict(member) for member in members if _attr(member, "did") == sender), {})
+        return SocialItem(
+            network="bluesky", account_id=self._account_id,
+            remote_id=f"chat:{convo_id}:{message['id']}",
+            author_id=sender, author_handle=_handle(profile) or sender,
+            author_display=profile.get("display_name") or profile.get("displayName") or "",
+            text=message.get("text", ""), visibility="direct",
+            created_at=_to_ms(message.get("sent_at") or message.get("sentAt")),
+            thread_root=f"chat:{convo_id}",
+        )
+
+    def _messages(self, *, limit: int = 40, convo_id: str = "") -> list[SocialItem]:
+        try:
+            chat = self._chat()
+            if convo_id:
+                response = chat.get_convo({"convo_id": convo_id})
+                convos = [_attr(response, "convo", {})]
+            else:
+                response = chat.list_convos({"limit": min(limit, 100)})
+                convos = _attr(response, "convos", []) or []
+            items = []
+            for convo in convos:
+                cid = _attr(convo, "id", "")
+                if not cid:
+                    continue
+                response = chat.get_messages({"convo_id": cid, "limit": min(limit, 100)})
+                for message in _attr(response, "messages", []) or []:
+                    message = _as_dict(message)
+                    # Deleted-message views carry no text and must not become posts.
+                    if message.get("id") and "text" in message:
+                        items.append(self._message_item(message, cid, _attr(convo, "members", []) or []))
+            items.sort(key=lambda item: item.created_at, reverse=True)
+            return items[:limit]
+        except Exception as exc:
+            raise _bluesky_error(exc) from exc
+
+    def send_direct_message(self, recipient: str, text: str) -> PublishResult:
+        if not recipient.strip() or not text.strip():
+            raise AdapterError("A recipient and message are required.", kind="validation")
+        try:
+            chat = self._chat()
+            if recipient.startswith(("chat:", "convo:")):
+                convo_id = recipient.split(":")[1]
+                chat.get_convo({"convo_id": convo_id})
+            else:
+                did = recipient.strip().lstrip("@")
+                if not did.startswith("did:"):
+                    did = _attr(self._require_client().resolve_handle(did), "did", "")
+                response = chat.get_convo_for_members({"members": [did]})
+                convo_id = _attr(_attr(response, "convo", {}), "id", "")
+            if not convo_id:
+                raise AdapterError("The conversation could not be found.", kind="validation")
+            response = chat.send_message({"convo_id": convo_id, "message": {"text": text}})
+            item = self._message_item(_as_dict(response), convo_id, [])
+            return PublishResult(remote_id=item.remote_id, item=item)
+        except Exception as exc:
+            raise _bluesky_error(exc) from exc
+
+    def notification_events(self, *, limit: int = 40) -> list[NotificationEvent]:
+        client = self._require_client()
+        try:
+            resp = client.app.bsky.notification.list_notifications({"limit": min(limit, 100)})
         except Exception as exc:  # noqa: BLE001
             raise _bluesky_error(exc) from exc
-        notes = _attr(resp, "notifications", None)
-        if notes is not None:
-            return [_post_to_item(_as_dict(n), account_id=self._account_id) for n in notes]
-        feed = _attr(resp, "feed", []) or []
-        return [_feedview_to_item(_as_dict(fv), account_id=self._account_id) for fv in feed]
+        notes = [_as_dict(note) for note in _attr(resp, "notifications", []) or []]
+        # Reactions contain a like/repost record, not the post's content.
+        subjects = list(dict.fromkeys(
+            note.get("reason_subject") for note in notes
+            if note.get("reason_subject") and note.get("reason") in {"like", "repost"}
+        ))
+        posts = {}
+        for start in range(0, len(subjects), 25):
+            try:
+                response = client.get_posts(subjects[start:start + 25])
+            except Exception:
+                # Deleted/private posts must not discard the notification itself.
+                continue
+            for post in _attr(response, "posts", []) or []:
+                mapped = _as_dict(post)
+                posts[mapped.get("uri")] = mapped
+        events = []
+        for note in notes:
+            reason = note.get("reason") or "unknown"
+            actor = note.get("author") or {}
+            post = note if reason in {"mention", "reply", "quote"} else posts.get(note.get("reason_subject"))
+            events.append(NotificationEvent(
+                notification_id=note.get("uri") or "", kind=reason,
+                actor_name=actor.get("display_name") or "", actor_handle=_handle(actor),
+                account_id=self._account_id, created_at=_to_ms(note.get("indexed_at")),
+                item=_post_to_item(post, account_id=self._account_id) if post else None,
+            ))
+        return events
 
     def thread(self, item: SocialItem) -> list[SocialItem]:
+        if item.remote_id.startswith("chat:"):
+            return sorted(self._messages(convo_id=item.remote_id.split(":")[1], limit=100),
+                          key=lambda message: message.created_at)
         client = self._require_client()
         target = item.remote_id or item.uri
         try:
@@ -285,9 +510,56 @@ class BlueskyAdapter(NetworkAdapter):
         return items
 
     def publish(self, request: PublishRequest) -> PublishResult:
+        if (request.visibility == "direct"
+                or (request.in_reply_to or "").startswith("chat:")
+                or (request.quote_of or "").startswith("chat:")):
+            raise AdapterError("Use the direct message dialog to send a private message.", kind="validation")
         client = self._require_client()
         try:
-            resp = client.send_post(text=request.text)
+            if request.poll:
+                raise AdapterError("Bluesky does not support polls.", kind="validation")
+            if request.visibility != "public":
+                raise AdapterError("Bluesky posts support public visibility only.", kind="privacy")
+            if any(media.kind != "image" or not media.local_path for media in request.media):
+                raise AdapterError("Bluesky publishing currently supports local image attachments only.", kind="validation")
+            kwargs = {}
+            if request.lang:
+                kwargs["langs"] = [request.lang]
+            if request.in_reply_to or request.quote_of or request.media:
+                from atproto import models
+
+                def reference(uri):
+                    response = client.get_posts([uri])
+                    post = next((_as_dict(post) for post in _attr(response, "posts", []) or []
+                                 if _attr(post, "uri") == uri), None)
+                    if not post or not post.get("cid"):
+                        raise AdapterError("The referenced post is unavailable.", kind="validation")
+                    return models.ComAtprotoRepoStrongRef.Main(uri=uri, cid=post["cid"]), post
+
+                if request.in_reply_to:
+                    parent, post = reference(request.in_reply_to)
+                    root_data = (post.get("record", {}).get("reply") or {}).get("root")
+                    root = models.ComAtprotoRepoStrongRef.Main(**root_data) if root_data else parent
+                    kwargs["reply_to"] = models.AppBskyFeedPost.ReplyRef(parent=parent, root=root)
+                quote = None
+                if request.quote_of:
+                    ref, _ = reference(request.quote_of)
+                    quote = models.AppBskyEmbedRecord.Main(record=ref)
+                images = None
+                if request.media:
+                    from pathlib import Path
+                    if len(request.media) > 4:
+                        raise AdapterError("Bluesky supports up to four images per post.", kind="validation")
+                    data = [Path(media.local_path).read_bytes() for media in request.media]
+                    images = models.AppBskyEmbedImages.Main(images=[
+                        models.AppBskyEmbedImages.Image(
+                            alt=media.alt_text, image=_attr(client.upload_blob(blob), "blob"))
+                        for media, blob in zip(request.media, data, strict=True)])
+                if quote and images:
+                    kwargs["embed"] = models.AppBskyEmbedRecordWithMedia.Main(record=quote, media=images)
+                elif quote or images:
+                    kwargs["embed"] = quote or images
+            resp = client.send_post(text=request.text, **kwargs)
         except Exception as exc:  # noqa: BLE001
             raise _bluesky_error(exc) from exc
         uri = _attr(resp, "uri", "") or ""
@@ -317,12 +589,23 @@ class BlueskyAdapter(NetworkAdapter):
         return ""
 
     def _interact(self, on_method: str, off_method: str, remote_id: str, on: bool) -> None:
+        if remote_id.startswith("chat:"):
+            raise AdapterError("Direct messages cannot be liked or reposted.", kind="validation")
         client = self._require_client()
         try:
             if on:
                 getattr(client, on_method)(remote_id, self._cid_for(remote_id))
             else:
-                getattr(client, off_method)(remote_id)
+                response = client.get_posts([remote_id])
+                post = next((_as_dict(post) for post in _attr(response, "posts", []) or []
+                             if _attr(post, "uri") == remote_id), None)
+                if post is None:
+                    raise AdapterError("The post could not be found.", kind="validation")
+                record_uri = (post.get("viewer") or {}).get(on_method)
+                if record_uri:
+                    result = getattr(client, off_method)(record_uri)
+                    if result is False:
+                        raise AdapterError("The interaction could not be removed.")
         except AdapterError:
             raise
         except Exception as exc:  # noqa: BLE001

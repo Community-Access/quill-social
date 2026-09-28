@@ -17,7 +17,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 from quill_social.capabilities import Capabilities
-from quill_social.model import Media, SocialItem
+from quill_social.model import Media, Poll, SocialItem
 
 ERROR_KINDS = ("transient", "validation", "permission", "privacy", "unknown")
 
@@ -46,6 +46,20 @@ class AdapterError(Exception):
 
 
 @dataclass
+class NotificationEvent:
+    """A network notification, distinct from the post it concerns."""
+
+    notification_id: str
+    kind: str
+    actor_name: str
+    item: SocialItem | None = None
+    account_id: str = ""
+    actor_handle: str = ""
+    created_at: int = 0
+    text: str = ""
+
+
+@dataclass
 class PublishRequest:
     """Everything one adapter needs to publish one post (PRD 15, 16.2)."""
 
@@ -56,6 +70,8 @@ class PublishRequest:
     in_reply_to: str = ""  # remote id of the parent, for thread publishing
     quote_of: str = ""
     media: list[Media] = field(default_factory=list)
+    poll: Poll | None = None
+    poll_expires_in: int | None = None
     idempotency_key: str = ""  # dedupe a retried publish (PRD 40, partial threads)
 
 
@@ -86,6 +102,14 @@ class NetworkAdapter(ABC):
     def notifications(self, *, limit: int = 40) -> list[SocialItem]:
         """Items that mention or involve the account."""
 
+    def notification_events(self, *, limit: int = 40) -> list[NotificationEvent]:
+        """Compatibility for adapters that expose only notification posts."""
+        return [NotificationEvent(
+            notification_id=item.remote_id, kind="mention", actor_name=item.author_display,
+            item=item, account_id=item.account_id, actor_handle=item.author_handle,
+            created_at=item.created_at,
+        ) for item in self.notifications(limit=limit)]
+
     @abstractmethod
     def thread(self, item: SocialItem) -> list[SocialItem]:
         """The full conversation containing ``item``, in reading order."""
@@ -101,6 +125,20 @@ class NetworkAdapter(ABC):
     def set_favourite(self, remote_id: str, on: bool = True) -> None:
         raise AdapterError("favourite not supported", kind="validation")
 
+    def fetch_timeline(self, kind: str, value: str = "", *, limit: int = 40) -> list[SocialItem]:
+        """Read an additional account timeline where the network supports it."""
+        raise AdapterError("This timeline is not supported for this network.", kind="validation")
+
+    def timeline_lists(self) -> list[tuple[str, str]]:
+        raise AdapterError("Lists are not supported for this network.", kind="validation")
+
+    def search(self, query: str, search_type: str = "", *, limit: int = 40) -> list[SocialItem]:
+        """Search the connected service for posts, users, hashtags, or all three."""
+        raise AdapterError("Search is not supported for this network.", kind="validation")
+
+    def send_direct_message(self, recipient: str, text: str) -> PublishResult:
+        raise AdapterError("Direct messages are not supported for this network.", kind="validation")
+
     def set_bookmark(self, remote_id: str, on: bool = True) -> None:
         raise AdapterError("bookmark not supported", kind="validation")
 
@@ -109,6 +147,14 @@ class NetworkAdapter(ABC):
 
     def delete(self, remote_id: str) -> None:
         raise AdapterError("delete not supported", kind="validation")
+
+    def own_profile(self) -> dict:
+        """Read editable profile fields for the authenticated account."""
+        raise AdapterError("Profile editing is not supported for this network.", kind="validation")
+
+    def update_profile(self, changes: dict) -> None:
+        """Apply explicitly edited profile fields, preserving other settings."""
+        raise AdapterError("Profile editing is not supported for this network.", kind="validation")
 
     @classmethod
     def available(cls) -> bool:

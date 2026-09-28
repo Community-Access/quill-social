@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from quill_social.model import new_id, now_ms
+from quill_social.model import SocialItem, new_id, now_ms
 
 # Notification categories (PRD 25.1).
 CATEGORIES = (
@@ -30,6 +30,9 @@ CATEGORIES = (
     "follow",
     "follow_request",
     "poll",
+    "status",
+    "update",
+    "quoted_update",
     "dm",
     "moderation",
     "scheduled_delivery",
@@ -41,6 +44,10 @@ CATEGORIES = (
     "discussion_response",
     "release",
     "media_done",
+    "severed_relationships",
+    "admin_sign_up",
+    "added_to_collection",
+    "collection_update",
 )
 
 # Categories that are always safety- or delivery-critical: never silenced by
@@ -58,6 +65,15 @@ _SUMMARY_VERBS = {
     "follow": "followed you",
     "quote": "quoted your post",
     "mention": "mentioned you",
+    "follow_request": "requested to follow you",
+    "status": "posted a new status",
+    "update": "edited a post",
+    "quoted_update": "edited a post you quoted",
+    "moderation": "sent a moderation notice",
+    "severed_relationships": "reported a severed relationship",
+    "admin_sign_up": "signed up",
+    "added_to_collection": "added you to a collection",
+    "collection_update": "updated a collection featuring you",
 }
 
 
@@ -72,8 +88,11 @@ class NotificationItem:
     actor_handle: str = ""
     actor_display: str = ""
     subject_id: str = ""  # the post/thread/PR the notification is about
+    subject_item_id: str = ""  # local SocialItem id, when the subject was cached
+    subject_uri: str = ""
     text: str = ""
     created: int = field(default_factory=now_ms)
+    read: bool = False
     count: int = 1  # >1 once grouped
     actors: list[str] = field(default_factory=list)
 
@@ -86,8 +105,11 @@ class NotificationItem:
             "actor_handle": self.actor_handle,
             "actor_display": self.actor_display,
             "subject_id": self.subject_id,
+            "subject_item_id": self.subject_item_id,
+            "subject_uri": self.subject_uri,
             "text": self.text,
             "created": self.created,
+            "read": self.read,
             "count": self.count,
             "actors": list(self.actors),
         }
@@ -102,8 +124,11 @@ class NotificationItem:
             actor_handle=d.get("actor_handle", ""),
             actor_display=d.get("actor_display", ""),
             subject_id=d.get("subject_id", ""),
+            subject_item_id=d.get("subject_item_id", ""),
+            subject_uri=d.get("subject_uri", ""),
             text=d.get("text", ""),
             created=int(d.get("created", 0) or 0),
+            read=bool(d.get("read", False)),
             count=int(d.get("count", 1) or 1),
             actors=list(d.get("actors", [])),
         )
@@ -223,6 +248,7 @@ def classify(
     now: int | None = None,
     quiet_hours: tuple[int, int] | None = None,
     focus: FocusMode | None = None,
+    now_minute: int | None = None,
 ) -> NotificationDecision:
     """Decide how one notification reaches the user (PRD 25.2, 25.4)."""
     at = now if now is not None else now_ms()
@@ -242,7 +268,7 @@ def classify(
     window = quiet_hours
     if focus is not None and focus.active_at(at) and focus.quiet_hours is not None:
         window = focus.quiet_hours
-    quiet = in_quiet_hours(minute_of_day(at), window) and not critical
+    quiet = in_quiet_hours(minute_of_day(at) if now_minute is None else now_minute, window) and not critical
 
     decision = NotificationDecision(
         delivered=True,
@@ -317,8 +343,11 @@ def group_duplicates(items: list[NotificationItem]) -> list[NotificationItem]:
                 actor_handle=first.actor_handle,
                 actor_display=first.actor_display,
                 subject_id=first.subject_id,
+                subject_item_id=first.subject_item_id,
+                subject_uri=first.subject_uri,
                 text=first.text,
                 created=members[-1].created,
+                read=all(member.read for member in members),
                 count=len(members),
                 actors=actors,
             )
@@ -327,6 +356,9 @@ def group_duplicates(items: list[NotificationItem]) -> list[NotificationItem]:
 
 
 def _summarize(item: NotificationItem) -> str:
+    if item.category == "poll":
+        who = item.actor_display or item.actor_handle or "an unknown author"
+        return f"A poll from {who} has ended"
     verb = _SUMMARY_VERBS.get(item.category, f"sent a {item.category.replace('_', ' ')}")
     if item.count > 1:
         actors = item.actors or [item.actor_display or item.actor_handle]
@@ -355,6 +387,108 @@ def build_digest(
 # -- persistence (generic document store) -------------------------------------
 
 POLICY_KIND = "notification_policy"
+ITEM_KIND = "notification"
+
+
+def normalize_category(category: str) -> str:
+    """Use QUILL's stable category names for network-specific event names."""
+    return {
+        "reblog": "repost",
+        "like": "favourite",
+        "admin.report": "moderation",
+        "moderation_warning": "moderation",
+        "admin.sign_up": "admin_sign_up",
+    }.get(category, category or "unknown")
+
+
+def item_key(item: NotificationItem) -> str:
+    """Return the stable document/list identity for a notification event."""
+    return f"notification:{item.network}:{item.account_id}:{item.notif_id}"
+
+
+def from_event(event, network: str) -> NotificationItem:
+    """Preserve a network NotificationEvent independently of its subject post."""
+    subject = event.item
+    return NotificationItem(
+        notif_id=event.notification_id,
+        category=normalize_category(event.kind),
+        account_id=event.account_id,
+        network=network,
+        actor_handle=event.actor_handle,
+        actor_display=event.actor_name,
+        subject_id=subject.remote_id if subject else "",
+        subject_item_id=subject.item_id if subject else "",
+        subject_uri=subject.uri if subject else "",
+        text=subject.text if subject else getattr(event, "text", ""),
+        created=event.created_at or (subject.created_at if subject else now_ms()),
+    )
+
+
+def summary(item: NotificationItem) -> str:
+    """Render an event as actor, action, and optional post excerpt."""
+    base = _summarize(item)
+    if item.text and item.category not in {"follow", "follow_request"}:
+        return f"{base}: {item.text}"
+    if item.category == "follow_request":
+        who = item.actor_display or item.actor_handle or "Someone"
+        return f"{who} requested to follow you"
+    return base
+
+
+def to_social_item(item: NotificationItem) -> SocialItem:
+    """Create the presentation row used by the existing accessible post list."""
+    return SocialItem(
+        item_id=item_key(item),
+        network=item.network,
+        account_id=item.account_id,
+        # Post actions need the subject's remote id. Statusless notifications
+        # retain a synthetic id and are rejected by post-only commands.
+        remote_id=item.subject_id or item_key(item),
+        uri=item.subject_uri,
+        # The text is already a complete actor/action sentence. Keeping the
+        # post-style Author field empty prevents rows such as "Ada. Ada
+        # favourited your post" while details still expose actor and handle.
+        author_handle="",
+        author_display="",
+        text=summary(item),
+        created_at=item.created,
+        visibility="notification",
+        read=item.read,
+    )
+
+
+def save_items(store, items: list[NotificationItem]) -> None:
+    """Upsert events without resetting notification-specific read state."""
+    for item in items:
+        key = item_key(item)
+        old = store.get_document(ITEM_KIND, key)
+        if old:
+            item.read = bool(old.get("read", False))
+        store.put_document(ITEM_KIND, key, item.to_dict(), ordinal=-item.created)
+
+
+def list_items(
+    store, account_id: str | None = None, *, categories: set[str] | None = None,
+    limit: int = 500,
+) -> list[NotificationItem]:
+    """Load saved events newest first, optionally scoped by account/category."""
+    rows = [NotificationItem.from_dict(d) for d in store.list_documents(ITEM_KIND)]
+    if account_id:
+        rows = [row for row in rows if row.account_id == account_id]
+    if categories is not None:
+        rows = [row for row in rows if row.category in categories]
+    rows.sort(key=lambda row: row.created, reverse=True)
+    return rows if limit < 0 else rows[:limit]
+
+
+def mark_read(store, row_id: str, read: bool = True) -> bool:
+    """Set read state by the synthetic SocialItem/document identity."""
+    data = store.get_document(ITEM_KIND, row_id)
+    if not data:
+        return False
+    data["read"] = bool(read)
+    store.put_document(ITEM_KIND, row_id, data, ordinal=-int(data.get("created", 0) or 0))
+    return True
 
 
 def _policy_key(policy: NotificationPolicy) -> str:

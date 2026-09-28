@@ -1,11 +1,10 @@
 # Testing QUILL Social with real accounts
 
-Everything needed for live sign-in is installed. This guide gets you from launch
-to a real timeline.
+Install the project dependencies, including the `networks` extra, before testing live sign-in. This guide gets you from launch to a real timeline.
 
 ## 1. Launch
 
-From `S:\q-social`:
+From your repository checkout:
 
 ```
 run-quill-social.bat
@@ -91,3 +90,24 @@ approvals, safety, notifications, analytics, and AI tools.
   report will tell you when something is not supported on a target.
 - The local scheduler runs every 30 seconds while the app is open, so a
   scheduled post publishes only while QUILL Social is running.
+
+## PR regression checks
+
+Run `python -m pytest -q` and `python -m ruff check .` in the project environment.
+
+Check both Standard and Advanced modes with a real account:
+
+- Navigate accounts and timelines without focus moving away from the selected control.
+- Open a conversation whose replies are not yet cached; confirm the network thread loads. Navigate away during loading and confirm it does not replace the new timeline.
+- Publish an image with alt text, a Mastodon poll, a reply, and a quote. Confirm the content on the server. Bluesky polls and unsupported attachment kinds should report an error and retain the draft.
+- Disconnect during publishing, then reopen the saved draft and check its attachments, poll, reply, visibility, and content warning. For partially sent threads or cross-posts, check successful destinations before resending.
+- Schedule a post and confirm keyboard navigation stays responsive during delivery. Failed partial threads should require review rather than restart automatically.
+- Set quiet hours covering the current system time and confirm automatic notification speech is suppressed while items remain available.
+- Check real notification event wording, author punctuation, quoted-post reading, local timezone display, and preferences persistence.
+
+Screen-reader testing status:
+
+- **NVDA: tested on Windows by the contributor**, including the testing session that identified mixed items in Home.
+- JAWS and Narrator: not yet tested.
+
+The Home cache fix has automated regression coverage; check Home again with a real account after restarting. Other platforms and release packaging remain separate validation work. Sounds are deferred.

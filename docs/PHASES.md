@@ -1,13 +1,10 @@
-# QUILL Social — phase completion map
+# QUILL Social implementation map
 
-This maps every phase and priority in the PRD (sections 36–37) to the code that
-implements it. The whole roadmap is built as tested, wx-free logic with an
-accessible wxPython shell on top; anything that needs a live external service
-(Mastodon/Bluesky/GitHub sign-in, an AI provider, libmpv, a cloud scheduler, an
-OS credential vault) sits behind an interface with a deterministic default, so
-the app runs and every test passes with no credentials and no network.
+This is a map of PRD requirements to existing modules, not a declaration that every phase is complete. This contribution focuses on usable, accessible social reading and composing: phases 1 and 2, with improvements to parts of phases 3 and 4. Standard mode keeps everyday reading and posting accessible; Advanced mode retains the existing workspace and publishing tools.
 
-Totals: 57 package modules, 41 test files, **363 tests passing**, ruff-clean.
+Live Mastodon and Bluesky reading, authentication, notifications, conversations, and publishing are connected. Automated tests use fake clients and local data. The user has tested the interface with NVDA; wider screen-reader and platform validation remains future work.
+
+Phases 5–8 have existing foundations and prototypes, but ecosystem integrations, hosted collaboration, production AI and media backends, and cross-platform release validation are not completed by this PR. Sounds remain deferred. The tables below locate code for review; they do not certify an entire priority as finished.
 
 ## Priorities
 
@@ -23,7 +20,7 @@ Totals: 57 package modules, 41 test files, **363 tests passing**, ruff-clean.
 | Media + alt text, content warnings, visibility, polls | `model.py`, `services/composer.py` |
 | Intelligent thread splitting | `services/thread_splitter.py` |
 | Search, folders, saves, drafts | `db.py` (FTS5), `services/smartfolder.py` |
-| Native + local scheduling | `services/scheduler.py`, `services/thread_publisher.py` |
+| Local scheduling; native scheduling interfaces | `services/scheduler.py`, `services/thread_publisher.py` |
 | Command center, Where Am I, help, remappable keys | `ui/commands.py`, `whereami.py`, `keymap.py` |
 | Secure credentials | `security/credentials.py` |
 
@@ -79,16 +76,11 @@ Totals: 57 package modules, 41 test files, **363 tests passing**, ruff-clean.
   plugin system (`services/plugins.py`), offline resilience
   (`services/outbox.py`), diagnostics (`security/diagnostics.py`).
 
-## What is a documented live boundary (not a gap)
+## Remaining boundaries
 
-These are implemented as interfaces with deterministic defaults and an
-`available()` probe; wiring the real dependency does not change the schema or UI:
-
-- Live Mastodon/Bluesky/GitHub network calls (adapters raise a clear error and
-  expose a capability probe until a client + OS-stored token is configured).
-- A real AI provider (the gateway ships a deterministic `MockProvider`).
-- libmpv playback (`MpvMediaEngine` boundary; `NullMediaEngine` is the default).
-- QUILL Cloud scheduling (the local + native tiers are complete; the cloud tier
-  is an interface).
-- OS credential vault (`WindowsCredentialManagerStore` boundary;
-  `InMemoryCredentialStore` default). The database only ever stores references.
+- Mastodon, Bluesky, and GitHub adapters can call live clients when configured. Credentials are stored through the OS keyring; the database stores references.
+- Local scheduling works while the app is open. Cloud scheduling and full native scheduling orchestration remain future work.
+- AI defaults to a deterministic mock provider; production provider configuration needs separate work.
+- Media playback defaults to a null backend. A complete player and ecosystem integrations remain future work.
+- Bluesky publishing currently supports images, replies, and quotes. Unsupported polls or other attachment kinds fail clearly and retain the draft.
+- This PR does not certify every P0 acceptance criterion or provide a release package. Use the PRD and manual testing guide for remaining validation.

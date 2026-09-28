@@ -13,6 +13,7 @@ so two commands never silently share a chord.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 BINDINGS_NAME = "keymap.json"
@@ -35,6 +36,7 @@ DEFAULT_BINDINGS: dict[str, str] = {
     "play_media": "Ctrl+Enter",
     "command_center": "Ctrl+Shift+C",
     "where_am_i": "Ctrl+Shift+I",
+    "repeat_announcement": "Ctrl+Shift+Space",
     "next_pane": "F6",
     "prev_pane": "Shift+F6",
     "refresh": "F5",
@@ -72,9 +74,29 @@ def normalize_chord(chord: str) -> str:
         elif low == "shift":
             mods_present.append("Shift")
         else:
-            key = p if len(p) > 1 else p.upper()
+            names = {name.lower(): name for name in (
+                "Enter", "Space", "Delete", "Backspace", "Escape", "Tab",
+                "Home", "End", "PageUp", "PageDown", "Up", "Down", "Left", "Right")}
+            key = names.get(low, p.upper())
     ordered = [m for m in _MOD_ORDER if m in mods_present]
     return "+".join([*ordered, key]) if key else "+".join(ordered)
+
+
+def validate_chord(chord: str, *, global_hotkey: bool = False) -> str:
+    """Validate editable shortcuts without importing the GUI toolkit."""
+    if not chord.strip():
+        return ""
+    parts = [p.strip().lower() for p in chord.split("+")]
+    keys = [p for p in parts if p not in {"ctrl", "control", "alt", "shift"}]
+    normalized = normalize_chord(chord)
+    key = normalized.split("+")[-1]
+    named = {"Enter", "Space", "Delete", "Backspace", "Escape", "Tab",
+             "Home", "End", "PageUp", "PageDown", "Up", "Down", "Left", "Right"}
+    if len(keys) != 1 or not (re.fullmatch(r"[A-Z0-9]|F(?:[1-9]|1[0-2])", key) or key in named):
+        raise ValueError("Enter a key such as Ctrl+Shift+N, Alt+B, or F5.")
+    if global_hotkey and not ({"Ctrl", "Alt"} & set(normalized.split("+")[:-1])):
+        raise ValueError("Global shortcuts must include Ctrl or Alt.")
+    return normalized
 
 
 class Keymap:
@@ -91,6 +113,8 @@ class Keymap:
 
     def command_for(self, chord: str) -> str | None:
         target = normalize_chord(chord)
+        if not target:
+            return None
         for cmd, ch in self._by_command.items():
             if ch == target:
                 return cmd
@@ -108,13 +132,13 @@ class Keymap:
         """
         target = normalize_chord(chord)
         if not target:
-            self._by_command.pop(command_id, None)
+            self._by_command[command_id] = ""
             return
         owner = self.command_for(target)
         if owner and owner != command_id:
             if not force:
                 raise ValueError(f"{chord} is already bound to {owner!r}")
-            del self._by_command[owner]
+            self._by_command[owner] = ""
         self._by_command[command_id] = target
 
     def as_dict(self) -> dict[str, str]:
@@ -188,6 +212,14 @@ def _build_keycode_names() -> dict[int, str]:
         wx.WXK_BACK: "Backspace",
         wx.WXK_ESCAPE: "Escape",
         wx.WXK_TAB: "Tab",
+        wx.WXK_HOME: "Home",
+        wx.WXK_END: "End",
+        wx.WXK_PAGEUP: "PageUp",
+        wx.WXK_PAGEDOWN: "PageDown",
+        wx.WXK_UP: "Up",
+        wx.WXK_DOWN: "Down",
+        wx.WXK_LEFT: "Left",
+        wx.WXK_RIGHT: "Right",
     }
     return names
 

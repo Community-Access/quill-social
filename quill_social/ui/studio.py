@@ -23,6 +23,7 @@ from quill_social.services.queue_schedule import (
     QueueSchedule,
     Slot,
 )
+from quill_social.time_display import format_timestamp, preference_for
 
 _WEEKDAYS = (
     "Monday",
@@ -102,7 +103,7 @@ class DraftsDialog(wx.Dialog):
         for draft in self._drafts:
             name = draft.name or "(untitled)"
             preview = draft.text.strip().replace("\n", " ")[:80] or "(empty)"
-            updated = _fmt_ms_utc(draft.updated)
+            updated = format_timestamp(draft.updated, preference_for(self.GetParent()))
             _add_row(self.list, [name, preview, str(len(draft.targets)), updated])
         if self._drafts:
             self.list.Select(0)
@@ -220,22 +221,24 @@ class AgendaDialog(wx.Dialog):
         drafts = {d.draft_id: d for d in self._store.list_drafts()}
         campaigns = {c.campaign_id: c for c in self._store.list_campaigns()}
         spacing = self.spacing.GetValue()
+        timezone = preference_for(self.GetParent())
         entries = calendar_svc.agenda(
             plans,
             now=now_ms(),
             drafts=drafts,
             campaigns=campaigns,
             min_spacing_min=spacing,
+            tz=timezone.upper() if timezone == "utc" else "system",
         )
         by_id = {e.plan_id: e for e in entries}
 
         view = _AGENDA_VIEWS[self.view.GetSelection()]
         if view == "Day":
-            groups = calendar_svc.group_by_day(plans)
+            groups = calendar_svc.group_by_day(plans, tz=timezone.upper() if timezone == "utc" else "system")
         elif view == "Week":
-            groups = calendar_svc.group_by_week(plans)
+            groups = calendar_svc.group_by_week(plans, tz=timezone.upper() if timezone == "utc" else "system")
         elif view == "Month":
-            groups = calendar_svc.group_by_month(plans)
+            groups = calendar_svc.group_by_month(plans, tz=timezone.upper() if timezone == "utc" else "system")
         else:
             groups = None
 
@@ -550,10 +553,10 @@ class QueueScheduleDialog(wx.Dialog):
         if first is None:
             lines.append("No available slot in the next 366 days.")
         else:
-            lines.append(f"Next available slot: {_fmt_ms_utc(first)} UTC")
+            lines.append(f"Next available slot: {format_timestamp(first, preference_for(self.GetParent()))}")
         lines.append(f"{len(slots)} slot(s) in the next 14 days:")
         for ms in slots[:6]:
-            lines.append(f"  {_fmt_ms_utc(ms)} UTC")
+            lines.append(f"  {format_timestamp(ms, preference_for(self.GetParent()))}")
         self.preview.SetValue("\n".join(lines))
 
     def _on_save(self) -> None:
@@ -704,7 +707,7 @@ class ApprovalsDialog(wx.Dialog):
         lines = [f"State: {record.state}"]
         for entry in record.audit:
             lines.append(
-                f"{_fmt_ms_utc(entry.at_ms)} UTC -- {entry.actor} ({entry.role}) "
+                f"{format_timestamp(entry.at_ms, preference_for(self.GetParent()))} -- {entry.actor} ({entry.role}) "
                 f"{entry.action}: {entry.from_state} to {entry.to_state}"
                 + (f" -- {entry.note}" if entry.note else "")
             )
@@ -786,16 +789,3 @@ class ApprovalsDialog(wx.Dialog):
             )
             return
         self._apply(record, approvals_svc.request_changes)
-
-
-# -- shared helpers -----------------------------------------------------------
-
-
-def _fmt_ms_utc(ms: int | None) -> str:
-    """Format epoch milliseconds as a plain UTC ``YYYY-MM-DD HH:MM`` string."""
-    if not ms:
-        return "unscheduled"
-    from datetime import UTC, datetime
-
-    dt = datetime.fromtimestamp(ms / 1000, tz=UTC)
-    return dt.strftime("%Y-%m-%d %H:%M")

@@ -27,6 +27,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from quill_social.model import Campaign, Draft, PublicationPlan, now_ms
+from quill_social.time_display import display_datetime
 
 # States that represent an approval phase (PRD 18.8); once a plan is queued or
 # later, approval is considered complete.
@@ -130,18 +131,22 @@ class ConflictPair:
 # -- helpers ------------------------------------------------------------------
 
 
-def _zone(name: str) -> ZoneInfo:
+def _zone(name: str) -> ZoneInfo | None:
+    if name == "system":
+        return None
     try:
         return ZoneInfo(name)
     except Exception:
         return ZoneInfo("UTC")
 
 
-def _local(ms: int, zone: ZoneInfo) -> datetime:
+def _local(ms: int, zone: ZoneInfo | None) -> datetime:
+    if zone is None:
+        return display_datetime(ms)
     return datetime.fromtimestamp(ms / 1000, tz=zone)
 
 
-def _when_text(ms: int | None, zone: ZoneInfo) -> str:
+def _when_text(ms: int | None, zone: ZoneInfo | None) -> str:
     if ms is None:
         return "Unscheduled"
     dt = _local(ms, zone)

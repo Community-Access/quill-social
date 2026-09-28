@@ -434,8 +434,19 @@ class SocialStore:
         limit: int = 500,
         offset: int = 0,
         newest_first: bool = True,
+        exclude_timeline_only: bool = False,
+        exclude_direct: bool = False,
+        home_only: bool = False,
     ) -> list[SocialItem]:
         clauses: list[str] = []
+        if home_only:
+            clauses.append("(item_id IN (SELECT doc_id FROM documents WHERE kind='home-post') "
+                           "OR (network='mock' AND item_id NOT IN "
+                           "(SELECT doc_id FROM documents WHERE kind='timeline-only')))")
+        if exclude_timeline_only:
+            clauses.append("item_id NOT IN (SELECT doc_id FROM documents WHERE kind='timeline-only')")
+        if exclude_direct:
+            clauses.append("visibility != 'direct'")
         params: list[object] = []
         if account_id:
             clauses.append("account_id=?")
@@ -493,15 +504,17 @@ class SocialStore:
                 (int(value), item_id),
             )
 
-    def search_items(self, query: str, *, limit: int = 200) -> list[SocialItem]:
+    def search_items(self, query: str, *, limit: int = 200, account_id: str | None = None) -> list[SocialItem]:
         """Full-text search over cached posts (PRD 26)."""
         q = _fts_query(query)
         if not q:
             return []
+        account_filter = " AND i.account_id=?" if account_id else ""
+        params = [q, account_id, limit] if account_id else [q, limit]
         rows = self.conn.execute(
-            """SELECT i.* FROM item_fts f JOIN items i ON i.item_id = f.item_id
-               WHERE item_fts MATCH ? ORDER BY i.created_at DESC LIMIT ?""",
-            (q, limit),
+            "SELECT i.* FROM item_fts f JOIN items i ON i.item_id = f.item_id "
+            f"WHERE item_fts MATCH ?{account_filter} ORDER BY i.created_at DESC LIMIT ?",
+            params,
         ).fetchall()
         return [SocialItem.from_row(dict(r)) for r in rows]
 
@@ -525,6 +538,20 @@ class SocialStore:
                 self.conn.execute("DELETE FROM item_fts WHERE item_id=?", (iid,))
                 self.conn.execute("DELETE FROM items WHERE item_id=?", (iid,))
         return len(doomed)
+
+    def clear_timeline_cache(self, account_id: str | None = None) -> int:
+        """Clear disposable rows, preserving saved posts and posts carrying local work."""
+        where = "bookmarked=0 AND flagged=0 AND favourited=0 AND tags='[]' AND folders='[]'"
+        params = []
+        if account_id:
+            where += " AND account_id=?"
+            params.append(account_id)
+        where += " AND item_id NOT IN (SELECT target_id FROM notes)"
+        with self.conn:
+            ids = [row[0] for row in self.conn.execute(f"SELECT item_id FROM items WHERE {where}", params)]
+            self.conn.executemany("DELETE FROM item_fts WHERE item_id=?", [(iid,) for iid in ids])
+            self.conn.executemany("DELETE FROM items WHERE item_id=?", [(iid,) for iid in ids])
+        return len(ids)
 
     # -- drafts ---------------------------------------------------------------
 

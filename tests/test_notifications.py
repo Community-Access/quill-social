@@ -1,5 +1,7 @@
 """Tests for notifications and attention management (PRD 25)."""
 
+from quill_social.adapters.base import NotificationEvent
+from quill_social.model import SocialItem
 from quill_social.services import notifications as notif
 
 
@@ -91,6 +93,12 @@ def test_build_digest_text():
     assert "replied to your post" in text
 
 
+def test_poll_notification_says_the_poll_has_ended():
+    item = _n(category="poll", actor="ada", text="Which option?")
+    assert notif.summary(item) == "A poll from Ada has ended: Which option?"
+    assert "A poll from Ada has ended" in notif.build_digest([item])
+
+
 def test_policy_persistence(store):
     p = notif.NotificationPolicy(account_id="acct1", category="mention", speak=False)
     notif.save_policy(store, p)
@@ -98,3 +106,31 @@ def test_policy_persistence(store):
     assert loaded is not None
     assert loaded.speak is False
     assert len(notif.load_policies(store)) == 1
+
+
+def test_event_persistence_keeps_reactions_and_statusless_follow_distinct(store):
+    post = SocialItem(item_id="local-post", account_id="mine", network="mastodon",
+                      remote_id="42", uri="https://example/@me/42", text="My post")
+    events = [
+        NotificationEvent("fav", "favourite", "Ada", post, "mine", "@ada", 3),
+        NotificationEvent("boost", "reblog", "Ben", post, "mine", "@ben", 2),
+        NotificationEvent("follow", "follow", "Cat", None, "mine", "@cat", 1),
+    ]
+    items = [notif.from_event(event, "mastodon") for event in events]
+    notif.save_items(store, items)
+    loaded = notif.list_items(store, "mine")
+    assert [item.notif_id for item in loaded] == ["fav", "boost", "follow"]
+    assert [item.category for item in loaded] == ["favourite", "repost", "follow"]
+    rows = [notif.to_social_item(item) for item in loaded]
+    assert rows[0].remote_id == rows[1].remote_id == "42"
+    assert rows[0].item_id != rows[1].item_id
+    assert rows[2].text == "Cat followed you"
+
+
+def test_notification_read_state_survives_refresh(store):
+    item = _n(account_id="mine", notif_id="one", created=10)
+    notif.save_items(store, [item])
+    row_id = notif.item_key(item)
+    assert notif.mark_read(store, row_id)
+    notif.save_items(store, [_n(account_id="mine", notif_id="one", created=10)])
+    assert notif.list_items(store, "mine")[0].read
